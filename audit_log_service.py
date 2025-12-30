@@ -175,3 +175,67 @@ def _pick_query() -> Query:
 def _read_payload(offset: int, length: int) -> Any:
     with open(PAYLOAD_FILE, "rb") as f:
         f.seek(offset)
+        return json.loads(f.read(length))
+
+
+def handle_request() -> Dict[str, Any]:
+    q = _pick_query()
+    offset_rows = (q.page - 1) * q.page_size
+
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT id, created_at, actor_id, action, resource_type, resource_id,
+               payload_offset, payload_len
+        FROM audit_events
+        WHERE created_at BETWEEN ? AND ?
+          AND (? IS NULL OR actor_id = ?)
+          AND (? IS NULL OR action = ?)
+        ORDER BY created_at DESC, id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (
+            q.from_ts,
+            q.to_ts,
+            q.actor_id,
+            q.actor_id,
+            q.action,
+            q.action,
+            q.page_size,
+            offset_rows,
+        ),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    events: List[Dict[str, Any]] = []
+    for (
+        eid,
+        created_at,
+        actor_id,
+        action,
+        rtype,
+        rid,
+        poff,
+        plen,
+    ) in rows:
+        payload = _read_payload(poff, plen)
+        events.append(
+            {
+                "id": eid,
+                "created_at": created_at,
+                "actor_id": actor_id,
+                "action": action,
+                "resource_type": rtype,
+                "resource_id": rid,
+                "payload": payload,
+            }
+        )
+
+    return {
+        "query": q.__dict__,
+        "events": events,
+        "count": len(events),
+    }
