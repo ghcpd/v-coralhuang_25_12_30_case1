@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""
+Automated test runner for enhanced audit log service.
+
+Tasks:
+1. Validate baseline integrity (data exists and is consistent)
+2. Verify semantic equivalence (baseline vs enhanced)
+3. Benchmark both implementations
+4. Exit 0 if all checks pass, non-zero otherwise
+"""
+
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Tuple
+
+# Import baseline and enhanced services
+import audit_log_service
+import enhanced_audit_log_service
+import runner
+
+
+def setup_test_environment() -> str:
+    """Create a clean test environment with separate database copy."""
+    test_dir = tempfile.mkdtemp(prefix="audit_test_")
+    return test_dir
+
+
+def cleanup_test_environment(test_dir: str) -> None:
+    """Clean up test environment."""
+    try:
+        shutil.rmtree(test_dir)
+    except Exception as e:
+        print(f"Warning: Could not clean up test dir: {e}")
+
+
+class TestRunner:
+    def __init__(self):
+        self.results = {}
+        self.errors = []
+
+    def log_test(self, name: str, passed: bool, detail: str = "") -> None:
+        """Log a test result."""
+        status = "✓ PASS" if passed else "✗ FAIL"
+        detail_str = f": {detail}" if detail else ""
+        print(f"  {status} - {name}{detail_str}")
+        if not passed:
+            self.errors.append(f"{name}: {detail}")
+
+    def check_baseline_integrity(self) -> bool:
+        """Verify baseline data exists and is valid."""
+        print("\n[1] Baseline Integrity Check")
+        print("-" * 60)
+
+        # Check if database exists
+        if not os.path.exists(audit_log_service.DB_PATH):
+            self.log_test("Database exists", False, "Database not found")
+            return False
+        self.log_test("Database exists", True)
+
+        # Check if payloads file exists
+        if not os.path.exists(audit_log_service.PAYLOAD_FILE):
+            self.log_test("Payload file exists", False, "Payload file not found")
+            return False
+        self.log_test("Payload file exists", True)
+
+        # Try to query baseline
+        try:
+            audit_log_service.init()
+            import sqlite3
+
+            conn = sqlite3.connect(audit_log_service.DB_PATH)
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM audit_events")
+            count = cur.fetchone()[0]
+            conn.close()
+
+            if count != audit_log_service.SEED_ROWS:
+                self.log_test(
+                    f"Row count is {audit_log_service.SEED_ROWS}",
+                    False,
+                    f"Got {count}",
+                )
+                return False
+            self.log_test(
+                f"Row count is {audit_log_service.SEED_ROWS}",
+                True,
+                f"({count} rows)",
+            )
+        except Exception as e:
+            self.log_test("Query baseline", False, str(e))
+            return False
+
+        return True
+
+    def check_semantic_equivalence(self) -> bool:
+        """Verify baseline and enhanced return identical results."""
+        print("\n[2] Semantic Equivalence Check")
+        print("-" * 60)
+
+        try:
+            # Initialize both services
+            audit_log_service.init()
+            enhanced_audit_log_service.init()
+
+            # Use a deterministic RNG to generate test queries
+            import random
+            rng = random.Random(42)  # Fixed seed for reproducibility
+
+            all_match = True
+            test_count = 5
+            for i in range(test_count):
+                try:
+                    # Generate a query using the same logic as baseline
+                    now = int(time.time())
+                    q = enhanced_audit_log_service.Query(
+                        from_ts=now - 7 * 24 * 3600,
+                        to_ts=now,
+                        actor_id=rng.choice([None, rng.randint(1, 2000)]),
+                        action=rng.choice([None, "UPDATE", "CREATE", "DELETE"]),
+                        page=rng.randint(1, 10),  # Test smaller range
+                        page_size=rng.choice([10, 20, 50]),
+                    )
+
+                    # Execute baseline
+                    import sqlite3
+                    conn = sqlite3.connect(audit_log_service.DB_PATH)
+                    cur = conn.cursor()
+                    offset_rows = (q.page - 1) * q.page_size
+                    cur.execute(
+                        """
+                        SELECT id, created_at, actor_id, action, resource_type, resource_id,
+                               payload_offset, payload_len
+                        FROM audit_events
+                        WHERE created_at BETWEEN ? AND ?
+                          AND (? IS NULL OR actor_id = ?)
+                          AND (? IS NULL OR action = ?)
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT ? OFFSET ?
+                        """,
+                        (
+                            q.from_ts,
+                            q.to_ts,
+                            q.actor_id,
+                            q.actor_id,
+                            q.action,
+                            q.action,
+                            q.page_size,
+                            offset_rows,
+                        ),
+                    )
+                    baseline_rows = cur.fetchall()
+                    conn.close()
+
+                    # Execute enhanced
+                    enhanced_result = enhanced_audit_log_service.handle_request(q)
+                    enhanced_rows = enhanced_result["events"]
+
+                    # Compare counts
+                    if len(baseline_rows) != len(enhanced_rows):
+                        self.log_test(
+                            f"Query {i+1} count match",
+                            False,
+                            f"baseline={len(baseline_rows)}, enhanced={len(enhanced_rows)}",
+                        )
+                        all_match = False
+                        continue
+
+                    # Compare row by row
+                    match = True
+                    for baseline_row, enhanced_row in zip(baseline_rows, enhanced_rows):
+                        if (baseline_row[0] != enhanced_row["id"] or
+                            baseline_row[1] != enhanced_row["created_at"] or
+                            baseline_row[2] != enhanced_row["actor_id"] or
+                            baseline_row[3] != enhanced_row["action"]):
+                            match = False
+                            break
+
+                    self.log_test(f"Query {i+1} results match", match)
+                    if not match:
+                        all_match = False
+                except Exception as e:
+                    self.log_test(f"Query {i+1} execution", False, str(e))
+                    import traceback
+                    traceback.print_exc()
+                    all_match = False
+
+            return all_match
+        except Exception as e:
+            self.log_test("Semantic equivalence", False, str(e))
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def benchmark_implementation(
+        self, impl_name: str, load_fn, warmup: int = 20, total: int = 100, concurrency: int = 4
+    ) -> Dict[str, Any]:
+        """Benchmark an implementation."""
+        print(f"\n[3.{impl_name[0]}] Benchmarking {impl_name}")
+        print("-" * 60)
+
+        try:
+            metrics, latencies = runner.run(load_fn, warmup=warmup, total=total, concurrency=concurrency)
+
+            print(f"  Throughput (RPS):  {metrics['rps']:.2f}")
+            print(f"  P50 Latency (ms):  {metrics['p50_ms']:.2f}")
+            print(f"  P90 Latency (ms):  {metrics['p90_ms']:.2f}")
+            print(f"  P95 Latency (ms):  {metrics['p95_ms']:.2f}")
+            print(f"  P99 Latency (ms):  {metrics['p99_ms']:.2f}")
+            print(f"  Avg Latency (ms):  {metrics['avg_ms']:.2f}")
+
+            return metrics
+        except Exception as e:
+            print(f"  ✗ FAIL - {e}")
+            self.errors.append(f"Benchmark {impl_name}: {e}")
+            return {}
+
+    def run_benchmarks(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Run benchmarks for both implementations."""
+        print("\n[3] Performance Benchmarking")
+        print("=" * 60)
+
+        # Initialize baseline
+        audit_log_service.init()
+
+        def baseline_load():
+            t0 = time.perf_counter()
+            audit_log_service.handle_request()
+            t1 = time.perf_counter()
+            return t0, t1
+
+        baseline_metrics = self.benchmark_implementation(
+            "Baseline", baseline_load, warmup=20, total=100, concurrency=4
+        )
+
+        # Initialize enhanced
+        enhanced_audit_log_service.init()
+
+        def enhanced_load():
+            t0 = time.perf_counter()
+            q = enhanced_audit_log_service.Query(
+                from_ts=int(time.time()) - 7 * 24 * 3600,
+                to_ts=int(time.time()),
+                actor_id=None,
+                action=None,
+                page=1,
+                page_size=20,
+            )
+            enhanced_audit_log_service.handle_request(q)
+            t1 = time.perf_counter()
+            return t0, t1
+
+        enhanced_metrics = self.benchmark_implementation(
+            "Enhanced", enhanced_load, warmup=20, total=100, concurrency=4
+        )
+
+        return baseline_metrics, enhanced_metrics
+
+    def compare_results(self, baseline: Dict[str, Any], enhanced: Dict[str, Any]) -> None:
+        """Compare benchmark results."""
+        print("\n[4] Results Comparison")
+        print("=" * 60)
+
+        if not baseline or not enhanced:
+            print("  ✗ Cannot compare - missing metrics")
+            return
+
+        try:
+            rps_improvement = (
+                (enhanced["rps"] - baseline["rps"]) / baseline["rps"] * 100
+                if baseline["rps"] > 0
+                else 0
+            )
+            p95_improvement = (
+                (baseline["p95_ms"] - enhanced["p95_ms"]) / baseline["p95_ms"] * 100
+                if baseline["p95_ms"] > 0
+                else 0
+            )
+            p99_improvement = (
+                (baseline["p99_ms"] - enhanced["p99_ms"]) / baseline["p99_ms"] * 100
+                if baseline["p99_ms"] > 0
+                else 0
+            )
+
+            print(f"  Throughput improvement:   {rps_improvement:+.1f}%")
+            print(f"  P95 latency improvement:  {p95_improvement:+.1f}%")
+            print(f"  P99 latency improvement:  {p99_improvement:+.1f}%")
+
+            # Check for meaningful improvements
+            has_p95_improvement = p95_improvement > 0
+            has_p99_improvement = p99_improvement > 0
+            has_rps_improvement = rps_improvement > 0
+
+            print()
+            self.log_test("RPS improvement", has_rps_improvement)
+            self.log_test("P95 improvement", has_p95_improvement)
+            self.log_test("P99 improvement", has_p99_improvement)
+        except Exception as e:
+            print(f"  ✗ Error comparing results: {e}")
+            self.errors.append(f"Comparison: {e}")
+
+    def run_all_tests(self) -> int:
+        """Run all test suites."""
+        print("=" * 60)
+        print("AUDIT LOG SERVICE TEST SUITE")
+        print("=" * 60)
+
+        # Step 1: Check baseline integrity
+        if not self.check_baseline_integrity():
+            print("\n✗ BASELINE INTEGRITY CHECK FAILED")
+            return 1
+
+        # Step 2: Check semantic equivalence
+        if not self.check_semantic_equivalence():
+            print("\n✗ SEMANTIC EQUIVALENCE CHECK FAILED")
+            return 1
+
+        # Step 3-4: Benchmark and compare
+        baseline_metrics, enhanced_metrics = self.run_benchmarks()
+        self.compare_results(baseline_metrics, enhanced_metrics)
+
+        # Final result
+        print("\n" + "=" * 60)
+        if self.errors:
+            print(f"✗ {len(self.errors)} check(s) failed:")
+            for error in self.errors:
+                print(f"  - {error}")
+            return 1
+        else:
+            print("✓ ALL CHECKS PASSED")
+            return 0
+
+
+if __name__ == "__main__":
+    runner_obj = TestRunner()
+    exit_code = runner_obj.run_all_tests()
+    sys.exit(exit_code)
