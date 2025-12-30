@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Run semantic checks and performance benchmarks for baseline and enhanced services.
+
+Usage: ./run_tests
+Exits 0 on success, non-zero on failure.
+"""
+from __future__ import annotations
+
+import sys
+import threading
+import time
+from typing import Callable, Dict, List, Tuple
+
+# Ensure imports from workspace
+import audit_log_service as baseline
+import enhanced_audit_log_service as enhanced
+import runner
+
+# Basic sanity check for Python version
+MIN_PY = (3, 8)
+if sys.version_info < MIN_PY:
+    print(f"Python {MIN_PY[0]}.{MIN_PY[1]}+ is required")
+    sys.exit(2)
+
+
+def baseline_query(q) -> Dict:
+    # mirror baseline SQL logic exactly
+    offset_rows = (q.page - 1) * q.page_size
+    conn = __import__("sqlite3").connect(baseline.DB_PATH, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, created_at, actor_id, action, resource_type, resource_id,
+               payload_offset, payload_len
+        FROM audit_events
+        WHERE created_at BETWEEN ? AND ?
+          AND (? IS NULL OR actor_id = ?)
+          AND (? IS NULL OR action = ?)
+        ORDER BY created_at DESC, id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (
+            q.from_ts,
+            q.to_ts,
+            q.actor_id,
+            q.actor_id,
+            q.action,
+            q.action,
+            q.page_size,
+            offset_rows,
+        ),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    events = []
+    for (
+        eid,
+        created_at,
+        actor_id,
+        action,
+        rtype,
+        rid,
+        poff,
+        plen,
+    ) in rows:
+        payload = baseline._read_payload(poff, plen)
+        events.append(
+            {
+                "id": eid,
+                "created_at": created_at,
+                "actor_id": actor_id,
+                "action": action,
+                "resource_type": rtype,
+                "resource_id": rid,
+                "payload": payload,
+            }
+        )
+    return {"query": q.__dict__, "events": events, "count": len(events)}
+
+
+def make_load_fn_from_queries(queries: List, exec_fn: Callable) -> Callable[[], Tuple[float, float]]:
+    idx = {"v": 0}
+    lock = threading.Lock()
+
+    def load_fn():
+        with lock:
+            if idx["v"] >= len(queries):
+                # wrap around if needed
+                idx["v"] = 0
+            q = queries[idx["v"]]
+            idx["v"] += 1
+        t0 = time.perf_counter()
+        exec_fn(q)
+        t1 = time.perf_counter()
+        return t0, t1
+
+    return load_fn
+
+
+def semantic_checks(sample_queries: List):
+    print("Running semantic equivalence checks...")
+    n = len(sample_queries)
+    for i, q in enumerate(sample_queries, 1):
+        b = baseline_query(q)
+        e = enhanced.handle_request_with_query(q)
+        if b["count"] != e["count"]:
+            print("Mismatch in count for query:", q)
+            print("baseline count", b["count"], "enhanced count", e["count"])
+            return False
+        if b["events"] != e["events"]:
+            print("Mismatch in events for query:", q)
+            # Print first differing event
+            for j, (be, ee) in enumerate(zip(b["events"], e["events"])):
+                if be != ee:
+                    print("First difference at index", j)
+                    print("baseline:", be)
+                    print("enhanced:", ee)
+                    break
+            else:
+                if len(b["events"]) != len(e["events"]):
+                    print("Different lengths: baseline", len(b["events"]), "enhanced", len(e["events"]))
+            return False
+        if i % 50 == 0:
+            print(f"  checked {i}/{n} queries")
+    print("Semantic checks passed for all sampled queries.")
+    return True
+
+
+def benchmark_run(queries: List, exec_fn: Callable, warmup: int, total: int, concurrency: int):
+    load_fn = make_load_fn_from_queries(queries, exec_fn)
+    metrics, latencies = runner.run(load_fn, warmup=warmup, total=total, concurrency=concurrency)
+    return metrics, latencies
+
+
+def percent_decrease(base: float, new: float) -> float:
+    if base == 0:
+        return float("inf") if new != 0 else 0.0
+    return (base - new) / base * 100.0
+
+
+def percent_increase(base: float, new: float) -> float:
+    if base == 0:
+        return float("inf") if new != 0 else 0.0
+    return (new - base) / base * 100.0
+
+
+def main():
+    # Ensure baseline data exists
+    print("Initializing datasets (may take a moment)...")
+    baseline.init()
+    enhanced.init()
+
+    # Prepare deterministic queries
+    TOTAL = 1000
+    WARMUP = 100
+    CONCURRENCY = 40
+    SAMPLE = 200
+
+    queries = [baseline._pick_query() for _ in range(WARMUP + TOTAL + SAMPLE)]
+
+    # Run semantic checks on SAMPLE queries
+    sample_qs = queries[:SAMPLE]
+    ok = semantic_checks(sample_qs)
+    if not ok:
+        print("Semantic equivalence checks failed.")
+        sys.exit(3)
+
+    # Run benchmarks
+    print("Running baseline benchmark...")
+    baseline_metrics, baseline_lat = benchmark_run(queries[WARMUP : WARMUP + TOTAL], baseline_query, warmup=0, total=TOTAL, concurrency=CONCURRENCY)
+    print("Baseline metrics:")
+    for k, v in baseline_metrics.items():
+        print(f"  {k}: {v}")
+
+    print("Running enhanced benchmark...")
+    enhanced_metrics, enhanced_lat = benchmark_run(queries[WARMUP : WARMUP + TOTAL], enhanced.handle_request_with_query, warmup=0, total=TOTAL, concurrency=CONCURRENCY)
+    print("Enhanced metrics:")
+    for k, v in enhanced_metrics.items():
+        print(f"  {k}: {v}")
+
+    # Evaluate improvements
+    p95_base = baseline_metrics["p95_ms"]
+    p95_new = enhanced_metrics["p95_ms"]
+    p99_base = baseline_metrics["p99_ms"]
+    p99_new = enhanced_metrics["p99_ms"]
+    rps_base = baseline_metrics["rps"]
+    rps_new = enhanced_metrics["rps"]
+
+    imp_p95 = percent_decrease(p95_base, p95_new)
+    imp_p99 = percent_decrease(p99_base, p99_new)
+    imp_rps = percent_increase(rps_base, rps_new)
+
+    print(f"Improvements: p95 {imp_p95:.1f}% , p99 {imp_p99:.1f}% , rps {imp_rps:.1f}%")
+
+    MIN_IMPROVEMENT_PCT = 10.0
+
+    if imp_p95 < MIN_IMPROVEMENT_PCT or imp_p99 < MIN_IMPROVEMENT_PCT or imp_rps < MIN_IMPROVEMENT_PCT:
+        print("Performance targets not met. Required >=10% improvement for p95, p99 and rps.")
+        sys.exit(4)
+
+    # On success, print a short report and exit 0
+    print("\nSUCCESS: Enhanced implementation passes semantic checks and performance targets.")
+    print("----- BASELINE METRICS -----")
+    for k, v in baseline_metrics.items():
+        print(f"{k}: {v}")
+    print("----- ENHANCED METRICS -----")
+    for k, v in enhanced_metrics.items():
+        print(f"{k}: {v}")
+
+    # Also print raw sample percentiles for record
+    print("Raw sample latencies (ms): baseline p95", p95_base, "p99", p99_base)
+    print("Raw sample latencies (ms): enhanced p95", p95_new, "p99", p99_new)
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
