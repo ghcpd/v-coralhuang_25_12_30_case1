@@ -1,20 +1,8 @@
 # runner.py (BASELINE — DO NOT EDIT)
-"""
-Fixed concurrency runner + latency percentiles.
-
-Contract:
-- warmup phase then measurement phase
-- fixed concurrency, total requests
-- reports P50/P90/P95/P99 + throughput (RPS)
-
-Optimized implementations must be benchmarked with this runner unchanged.
-"""
-
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, List, Tuple
-
 
 def _percentile(xs: List[float], p: float) -> float:
     xs = sorted(xs)
@@ -26,7 +14,6 @@ def _percentile(xs: List[float], p: float) -> float:
     if f == c:
         return xs[f]
     return xs[f] + (xs[c] - xs[f]) * (k - f)
-
 
 def run(load_fn: Callable[[], Tuple[float, float]], warmup: int, total: int, concurrency: int) -> Tuple[dict, List[float]]:
     latencies: List[float] = []

@@ -1,16 +1,80 @@
-### 1. Enhanced Implementation (Code)
+## **Enhancement – Improve Efficiency and Robustness of an Existing Backend Feature (Implementation Required)**
 
-You must provide:
+### Fixed Baseline Contract (Read Carefully)
 
-* One or more **new source files** implementing the enhancement
-* Baseline files must remain **unchanged**
-* Enhanced implementation must be runnable independently
+The baseline implementation:
 
-> No code review is required unless validation fails.
+* Uses **OFFSET-based pagination**
+* Stores audit event payloads in a **single disk-backed JSONL file**
+* For each returned event:
+
+  * Performs a disk seek + read
+  * Decodes JSON payload
+* Sort order is fixed:
+
+  ```
+  created_at DESC, id DESC
+  ```
+
+**Baseline files are immutable**:
+
+* `audit_log_service.py`
+* `runner.py`
+
+You must not modify them in any way.
 
 ---
 
-### 2. One-Command Automated Verification (`run_tests`) **[MANDATORY]**
+### Dataset Characteristics (Do Not Change)
+
+The dataset and query distribution are part of the contract:
+
+* Rows: **50,000**
+* Page range: `page ∈ [1, 2000]`
+* Page size: `{10, 20, 50}`
+* Payload size: JSON with a 256–1024 char text field
+* Payloads must be read from disk for each returned event
+
+You must not regenerate data with a different size, structure, or storage model.
+
+---
+
+### Your Task
+
+Enhance the existing implementation by improving execution efficiency and robustness under concurrency, **while strictly preserving semantics**.
+
+Typical enhancement directions include (but are not limited to):
+
+* Cursor / Keyset pagination
+* More efficient query patterns
+* Improved resource lifecycle and concurrency management
+
+This is an **enhancement** task, not a rewrite, refactor, or feature change.
+
+---
+
+### Hard Constraints (Mandatory)
+
+* Semantic equivalence is mandatory
+
+  * Same fields
+  * Same ordering
+  * Same result counts
+  * Same disk-backed payload reads
+* Baseline files must remain unchanged
+* Enhancements must be implemented via **new files only**
+* **Python standard library only** (no third-party dependencies)
+
+---
+
+### Required Deliverables (Strict)
+
+#### 1. Enhanced Implementation
+
+* One or more **new source files** implementing the enhanced logic
+* Baseline files must remain runnable and unchanged
+
+#### 2. One-Command Automated Test Runner
 
 You must provide an executable script named:
 
@@ -18,135 +82,80 @@ You must provide an executable script named:
 run_tests
 ```
 
-The script **must complete all checks automatically** and print results in a **clearly structured format**.
+The script must:
 
-#### `run_tests` MUST perform, in order:
+* Be runnable via:
 
-##### (a) Baseline Integrity Check
-
-* Verify baseline files are unchanged (e.g. checksum or diff)
-* Print:
-
+  ```bash
+  ./run_tests
   ```
-  BASELINE_CHECK: PASS
-  ```
+* Automatically perform:
 
-  or
+  * Baseline integrity verification
+  * Semantic equivalence checks (baseline vs enhanced)
+  * Performance benchmarking using the provided `runner.py`
+* Print results directly to the terminal, including:
 
-  ```
-  BASELINE_CHECK: FAIL
-  ```
+  * Throughput (RPS)
+  * P50 / P90 / P95 / P99 latency
+* Exit with:
 
-##### (b) Semantic Equivalence Check
+  * Code `0` only if **all checks pass**
+  * Non-zero code if any check fails
 
-* Run **at least N=50 deterministic queries**
-* Compare baseline vs enhanced outputs
-* Print:
-
-  ```
-  SEMANTIC_CHECK: PASS (50/50)
-  ```
-
-  or
-
-  ```
-  SEMANTIC_CHECK: FAIL
-  ```
-
-##### (c) Performance Benchmark
-
-* Run baseline and enhanced using the same runner
-* Print metrics in **machine- and human-readable table form**:
-
-```
-PERFORMANCE:
-METRIC        BASELINE     ENHANCED     DELTA(%)
-RPS           123.4        182.1        +47.5
-P50_MS        18.2         16.9         -7.1
-P90_MS        45.1         29.3         -35.0
-P95_MS        82.7         41.5         -49.8
-P99_MS        160.3        78.2         -51.2
-```
-
-##### (d) Exit Code Contract
-
-* Exit code **0** only if **all checks pass**
-* Non-zero exit code if **any** check fails
-
-> If `run_tests` exits successfully, reviewers may assume correctness unless obvious cheating is detected.
+Manual or multi-step testing is not acceptable.
 
 ---
 
-### 3. README.md (Strict Structure Required)
+#### 3. Reproducible Environment Specification (Required)
 
-README **must follow the structure below**.
-Free-form README will not be accepted.
+You must provide a **reusable, deterministic environment setup**, either by:
 
-#### Required Sections (in this exact order)
+* Clearly documenting the required Python version and setup steps in `README.md`, or
+* Providing minimal environment configuration files (e.g. `.env.example` if needed)
 
-##### 1. Overview
-
-* One paragraph summarizing what was enhanced and why
-
-##### 2. Baseline Bottlenecks (Bullet Points Only)
-
-* Identify **at most 3** concrete bottlenecks
-* Example:
-
-  * OFFSET deep pagination causes linear scan cost
-  * Per-request SQLite connection churn
-  * Per-row disk payload I/O amplification
-
-##### 3. Enhancement Strategy (Bullet Points Only)
-
-* At most 5 bullets
-* Each bullet must map to one bottleneck above
-
-##### 4. Semantic Preservation Checklist
-
-Must explicitly confirm (YES/NO):
-
-```
-- Same ordering (created_at DESC, id DESC): YES
-- Same result count per request: YES
-- Same returned fields: YES
-- Payload still read from disk per event: YES
-```
-
-##### 5. How to Run
-
-```bash
-./run_tests
-```
-
-##### 6. Raw Results
-
-Paste the **exact output** of `run_tests`.
+A reviewer must be able to run `./run_tests` on a clean machine without manual intervention.
 
 ---
 
-### 4. Environment Specification (Minimal & Explicit)
+#### 4. README.md (Mandatory)
 
-Provide one of the following (choose ONE):
+You must provide a `README.md` that includes **at minimum**:
 
-* `requirements.txt` (empty is acceptable if stdlib only)
-* OR a short section in README stating:
+* A brief description of the baseline bottlenecks
+* The enhancement strategy and why it improves performance
+* Confirmation that semantics are preserved
+* Environment setup instructions
+* How to run:
 
+  ```bash
+  ./run_tests
   ```
-  Python >= 3.10
-  No external dependencies
-  ```
+* The **raw output** of a successful `run_tests` execution
+
+Free-form or purely theoretical documentation is not sufficient.
 
 ---
 
-## Simplified Acceptance Criteria (For Reviewers)
+### Acceptance Criteria
 
-A submission is **accepted** if and only if:
+A submission is considered successful only if:
 
-1. `run_tests` exits with code 0
-2. `BASELINE_CHECK: PASS`
-3. `SEMANTIC_CHECK: PASS`
-4. Performance table shows **non-trivial improvement** in P95/P99 or RPS
-5. README follows required structure
+* Baseline files are unchanged
+* `./run_tests` runs successfully with exit code `0`
+* Semantic equivalence checks pass
+* P95 / P99 latency improves meaningfully compared to baseline
+* Throughput improves meaningfully compared to baseline
+* Results are reproducible using the documented environment
 
-**No manual code review is required** unless cheating is suspected.
+---
+
+### Important Reminder
+
+This is not a theoretical exercise.
+
+Treat this as a **production enhancement under SLA pressure**:
+
+* The system is already live
+* Behavior must not change
+* Improvements must be measurable, reproducible, and defensible
