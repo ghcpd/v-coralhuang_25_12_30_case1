@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""One-command test runner.
+
+Runs:
+- Baseline integrity checks
+- Semantic equivalence tests (baseline vs enhanced)
+- Performance benchmarks using runner.run
+
+Exits 0 only if all checks pass.
+"""
+import sys
+import time
+import json
+import statistics
+import importlib
+import random
+
+# imports from workspace
+import audit_log_service as baseline
+import audit_log_service_enhanced as enhanced
+import runner
+
+# test parameters
+SEMANTIC_TESTS = 100
+WARMUP = 50
+TOTAL = 400
+CONCURRENCY = 40
+
+PASS_IMPROVEMENT = 0.10  # require >=10% improvement in P95, P99 and RPS
+
+
+def assert_baseline_untouched() -> None:
+    # simple heuristic checks
+    with open("audit_log_service.py", "r", encoding="utf-8") as f:
+        src = f.read()
+        if "DO NOT EDIT" not in src:
+            print("ERROR: audit_log_service.py appears modified")
+            sys.exit(2)
+    with open("runner.py", "r", encoding="utf-8") as f:
+        src = f.read()
+        if "DO NOT EDIT" not in src:
+            print("ERROR: runner.py appears modified")
+            sys.exit(2)
+
+
+def semantic_checks() -> None:
+    print("\n=== Semantic equivalence checks ===")
+    # ensure data is seeded before issuing requests
+    baseline.init()
+    # make sure payload file exists (handle partial workspace state)
+    import os
+    if not os.path.exists(baseline.PAYLOAD_FILE):
+        print("Payload file missing; forcing reseed (removing DB)...")
+        try:
+            os.remove(baseline.DB_PATH)
+        except Exception:
+            pass
+        baseline.init()
+    enhanced.init()
+    for i in range(SEMANTIC_TESTS):
+        base = baseline.handle_request()
+        q = base["query"]
+        enh = enhanced.handle_request_for_query(q)
+
+        if base["count"] != enh["count"]:
+            print(f"Mismatch count on iteration {i}: base={base['count']} enh={enh['count']}")
+            print("Query:", q)
+            sys.exit(3)
+
+        if len(base["events"]) != len(enh["events"]):
+            print(f"Mismatch events length on iteration {i}")
+            print("Query:", q)
+            sys.exit(3)
+
+        for j, (be, ee) in enumerate(zip(base["events"], enh["events"])):
+            if be.keys() != ee.keys():
+                print(f"Field mismatch in event {j} on iter {i}")
+                print("base fields:", be.keys())
+                print("enh fields:", ee.keys())
+                sys.exit(3)
+            # compare primitive fields
+            for fld in ("id", "created_at", "actor_id", "action", "resource_type", "resource_id"):
+                if be[fld] != ee[fld]:
+                    print(f"Value mismatch field={fld} event={j} iter={i}: base={be[fld]} enh={ee[fld]}")
+                    print("Query:", q)
+                    sys.exit(3)
+            # compare payloads (deep equality)
+            if be["payload"] != ee["payload"]:
+                print(f"Payload mismatch event={j} iter={i}")
+                print("Query:", q)
+                sys.exit(3)
+    print(f"✅ Semantic checks passed ({SEMANTIC_TESTS} samples)")
+
+
+def make_timed_loader(fn):
+    def _load():
+        t0 = time.perf_counter()
+        fn()
+        t1 = time.perf_counter()
+        return t0, t1
+    return _load
+
+
+def benchmark() -> dict:
+    print("\n=== Benchmarking ===")
+
+    # reset RNGs so both implementations see the same query distribution statistically
+    baseline._rng = random.Random(1337)
+
+    # baseline benchmark
+    print("Running baseline...")
+    baseline.init()
+    base_metrics, base_latencies = runner.run(make_timed_loader(baseline.handle_request), WARMUP, TOTAL, CONCURRENCY)
+    print("Baseline:", json.dumps(base_metrics, indent=2))
+
+    # enhanced benchmark
+    print("Running enhanced...")
+    # reset baseline RNG to ensure similar distribution during enhanced run
+    baseline._rng = random.Random(1337)
+    enhanced.init()
+    enh_metrics, enh_latencies = runner.run(make_timed_loader(enhanced.handle_request), WARMUP, TOTAL, CONCURRENCY)
+    print("Enhanced:", json.dumps(enh_metrics, indent=2))
+
+    return {
+        "baseline": base_metrics,
+        "enhanced": enh_metrics,
+    }
+
+
+def assert_improvement(metrics: dict) -> None:
+    b = metrics["baseline"]
+    e = metrics["enhanced"]
+
+    def pct(old, new):
+        if old == 0:
+            return float("inf") if new > 0 else 0.0
+        return (old - new) / old
+
+    p95_imp = pct(b["p95_ms"], e["p95_ms"])
+    p99_imp = pct(b["p99_ms"], e["p99_ms"])
+    rps_imp = (e["rps"] - b["rps"]) / b["rps"] if b["rps"] else float("inf")
+
+    print("\n=== Improvement summary ===")
+    print(f"P95 improvement: {p95_imp*100:.1f}% (baseline {b['p95_ms']:.2f} ms -> enhanced {e['p95_ms']:.2f} ms)")
+    print(f"P99 improvement: {p99_imp*100:.1f}% (baseline {b['p99_ms']:.2f} ms -> enhanced {e['p99_ms']:.2f} ms)")
+    print(f"RPS improvement:  {rps_imp*100:.1f}% (baseline {b['rps']:.2f} -> enhanced {e['rps']:.2f})")
+
+    ok = True
+    if p95_imp < PASS_IMPROVEMENT:
+        print("\n⚠️  P95 did not improve enough")
+        ok = False
+    if p99_imp < PASS_IMPROVEMENT:
+        print("\n⚠️  P99 did not improve enough")
+        ok = False
+    if rps_imp < PASS_IMPROVEMENT:
+        print("\n⚠️  Throughput did not improve enough")
+        ok = False
+
+    if not ok:
+        print("\n❌ Performance requirements NOT met")
+        sys.exit(4)
+
+    print("\n✅ Performance improved meaningfully")
+
+
+def main() -> None:
+    print("Run tests — baseline integrity, semantic equivalence, performance")
+    assert_baseline_untouched()
+    semantic_checks()
+    metrics = benchmark()
+    assert_improvement(metrics)
+
+    print("\nAll checks passed — exit 0")
+    # print raw results for README inclusion
+    print("\n--- RAW RESULTS ---")
+    print(json.dumps(metrics, indent=2))
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
