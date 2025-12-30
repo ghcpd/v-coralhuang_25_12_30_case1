@@ -1,0 +1,152 @@
+### 1. Enhanced Implementation (Code)
+
+You must provide:
+
+* One or more **new source files** implementing the enhancement
+* Baseline files must remain **unchanged**
+* Enhanced implementation must be runnable independently
+
+> No code review is required unless validation fails.
+
+---
+
+### 2. One-Command Automated Verification (`run_tests`) **[MANDATORY]**
+
+You must provide an executable script named:
+
+```
+run_tests
+```
+
+The script **must complete all checks automatically** and print results in a **clearly structured format**.
+
+#### `run_tests` MUST perform, in order:
+
+##### (a) Baseline Integrity Check
+
+* Verify baseline files are unchanged (e.g. checksum or diff)
+* Print:
+
+  ```
+  BASELINE_CHECK: PASS
+  ```
+
+  or
+
+  ```
+  BASELINE_CHECK: FAIL
+  ```
+
+##### (b) Semantic Equivalence Check
+
+* Run **at least N=50 deterministic queries**
+* Compare baseline vs enhanced outputs
+* Print:
+
+  ```
+  SEMANTIC_CHECK: PASS (50/50)
+  ```
+
+  or
+
+  ```
+  SEMANTIC_CHECK: FAIL
+  ```
+
+##### (c) Performance Benchmark
+
+* Run baseline and enhanced using the same runner
+* Print metrics in **machine- and human-readable table form**:
+
+```
+PERFORMANCE:
+METRIC        BASELINE     ENHANCED     DELTA(%)
+RPS           123.4        182.1        +47.5
+P50_MS        18.2         16.9         -7.1
+P90_MS        45.1         29.3         -35.0
+P95_MS        82.7         41.5         -49.8
+P99_MS        160.3        78.2         -51.2
+```
+
+##### (d) Exit Code Contract
+
+* Exit code **0** only if **all checks pass**
+* Non-zero exit code if **any** check fails
+
+> If `run_tests` exits successfully, reviewers may assume correctness unless obvious cheating is detected.
+
+---
+
+### 3. README.md (Strict Structure Required)
+
+README **must follow the structure below**.
+Free-form README will not be accepted.
+
+#### Required Sections (in this exact order)
+
+##### 1. Overview
+
+* One paragraph summarizing what was enhanced and why
+
+##### 2. Baseline Bottlenecks (Bullet Points Only)
+
+* Identify **at most 3** concrete bottlenecks
+* Example:
+
+  * OFFSET deep pagination causes linear scan cost
+  * Per-request SQLite connection churn
+  * Per-row disk payload I/O amplification
+
+##### 3. Enhancement Strategy (Bullet Points Only)
+
+* At most 5 bullets
+* Each bullet must map to one bottleneck above
+
+##### 4. Semantic Preservation Checklist
+
+Must explicitly confirm (YES/NO):
+
+```
+- Same ordering (created_at DESC, id DESC): YES
+- Same result count per request: YES
+- Same returned fields: YES
+- Payload still read from disk per event: YES
+```
+
+##### 5. How to Run
+
+```bash
+./run_tests
+```
+
+##### 6. Raw Results
+
+Paste the **exact output** of `run_tests`.
+
+---
+
+### 4. Environment Specification (Minimal & Explicit)
+
+Provide one of the following (choose ONE):
+
+* `requirements.txt` (empty is acceptable if stdlib only)
+* OR a short section in README stating:
+
+  ```
+  Python >= 3.10
+  No external dependencies
+  ```
+
+---
+
+## Simplified Acceptance Criteria (For Reviewers)
+
+A submission is **accepted** if and only if:
+
+1. `run_tests` exits with code 0
+2. `BASELINE_CHECK: PASS`
+3. `SEMANTIC_CHECK: PASS`
+4. Performance table shows **non-trivial improvement** in P95/P99 or RPS
+5. README follows required structure
+
+**No manual code review is required** unless cheating is suspected.
